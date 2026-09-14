@@ -87,7 +87,44 @@ class TestFrontmatter:
         assert fm == {} and body == raw
 
 
+class TestOpenCodeBundledAgents:
+    def test_opencode_subagents_use_markdown_frontmatter(self) -> None:
+        agents_dir = BUNDLED_DIR / "providers" / "opencode" / "agents"
+        for agent_name in OPENCODE_AGENT_NAMES:
+            path = agents_dir / f"{agent_name}.md"
+            assert path.exists(), f"missing bundled OpenCode agent: {agent_name}"
+
+            frontmatter, body = parse_frontmatter(path.read_text(encoding="utf-8"))
+            permission = frontmatter.get("permission")
+
+            assert frontmatter["description"]
+            assert frontmatter["mode"] == "subagent"
+            assert "model" not in frontmatter
+            assert isinstance(permission, dict)
+            assert permission["edit"] == "deny"
+            assert permission["task"] == "deny"
+            assert body.lstrip().startswith("#")
+
+    def test_opencode_subagent_bodies_preserve_role_intent(self) -> None:
+        opencode_dir = BUNDLED_DIR / "providers" / "opencode" / "agents"
+        claude_dir = BUNDLED_DIR / "providers" / "claude" / "agents"
+        for agent_name in OPENCODE_AGENT_NAMES:
+            _, opencode_body = parse_frontmatter(
+                (opencode_dir / f"{agent_name}.md").read_text(encoding="utf-8")
+            )
+            _, claude_body = parse_frontmatter(
+                (claude_dir / f"{agent_name}.md").read_text(encoding="utf-8")
+            )
+            assert opencode_body == claude_body
+
+
 BUNDLED_DIR = Path(__file__).resolve().parents[1] / "src" / "zenith_harness" / "bundled"
+OPENCODE_AGENT_NAMES = (
+    "contract-review",
+    "feature-reviewer",
+    "flow-validator",
+    "investigator",
+)
 
 
 def _bundled_md_files() -> list[Path]:
