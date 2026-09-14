@@ -667,6 +667,43 @@ class TestInit:
         assert config_path.read_text(encoding="utf-8") == original_json
         assert jsonc_path.read_text(encoding="utf-8") == jsonc
 
+    def test_opencode_root_strict_json_shadowing_zenith_fails_without_mutation(
+        self, runner: CliRunner, workspace: Path, env: dict[str, str]
+    ) -> None:
+        config_path = workspace / ".opencode" / "opencode.json"
+        config_path.parent.mkdir()
+        original_managed = '{"theme": "system"}\n'
+        config_path.write_text(original_managed, encoding="utf-8")
+        root_config_path = workspace / "opencode.json"
+        root_config = json.dumps(
+            {
+                "theme": "root-user-config",
+                "mcp": {
+                    "zenith": {
+                        "type": "local",
+                        "command": ["node", "shadowed.js"],
+                        "environment": {"SHADOW": "root-strict-json"},
+                        "enabled": True,
+                        "timeout": 42,
+                    }
+                },
+            },
+            indent=2,
+        ) + "\n"
+        root_config_path.write_text(root_config, encoding="utf-8")
+
+        r = runner.invoke(
+            cli, ["init", "--workspace-dir", str(workspace), "--agent", "opencode"]
+        )
+
+        assert r.exit_code != 0
+        assert "opencode.json" in r.output
+        assert "mcp.zenith" in r.output
+        assert "remove that root entry" in r.output.lower()
+        assert "SHADOW" not in r.output
+        assert config_path.read_text(encoding="utf-8") == original_managed
+        assert root_config_path.read_text(encoding="utf-8") == root_config
+
     def test_opencode_init_does_not_persist_ambient_defaults_or_provider_secrets(
         self,
         runner: CliRunner,

@@ -497,6 +497,7 @@ def _write_bootstrap_config(
 
 def _write_opencode_config(path: Path, entry: dict[str, object]) -> None:
     _fail_if_opencode_jsonc_shadows_managed_entry(path)
+    _fail_if_opencode_root_strict_json_shadows_managed_entry(path)
 
     config: dict[str, object]
     if path.exists():
@@ -565,6 +566,40 @@ def _opencode_jsonc_paths(path: Path) -> tuple[Path, ...]:
         if candidate not in deduped:
             deduped.append(candidate)
     return tuple(deduped)
+
+
+def _fail_if_opencode_root_strict_json_shadows_managed_entry(path: Path) -> None:
+    if path.parent.name != ".opencode":
+        return
+    root_json_path = path.parent.parent / path.name
+    if not root_json_path.exists():
+        return
+    if _strict_json_defines_mcp_zenith(root_json_path):
+        raise click.ClickException(
+            f"Cannot update {path}: {root_json_path} defines mcp.zenith, "
+            "which OpenCode loads alongside the managed .opencode JSON and "
+            "may merge into the effective registration. Remove that root "
+            "entry, rename the user MCP server, or keep Zenith's mcp.zenith "
+            "only in .opencode/opencode.json before rerunning zenith init."
+        )
+
+
+def _strict_json_defines_mcp_zenith(path: Path) -> bool:
+    text = path.read_text(encoding="utf-8")
+    try:
+        loaded = json.loads(text)
+    except json.JSONDecodeError as exc:
+        if '"mcp"' in text and '"zenith"' in text:
+            raise click.ClickException(
+                f"Cannot verify {path}: it appears to define mcp.zenith but "
+                "is not parseable as strict JSON. Fix or remove that root "
+                "entry before rerunning zenith init."
+            ) from exc
+        return False
+    if not isinstance(loaded, dict):
+        return False
+    mcp = loaded.get("mcp")
+    return isinstance(mcp, dict) and "zenith" in mcp
 
 
 def _jsonc_defines_mcp_zenith(path: Path) -> bool:
