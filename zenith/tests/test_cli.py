@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 from click.testing import CliRunner
 
+from zenith_harness.assets import parse_frontmatter
 from zenith_harness.cli import cli
 
 
@@ -33,6 +34,35 @@ def _expected_mcp_server_args() -> list[str]:
         "--mode",
         "orchestrator",
     ]
+
+
+BUNDLED_DIR = Path(__file__).resolve().parents[1] / "src" / "zenith_harness" / "bundled"
+OPENCODE_AGENT_NAMES = (
+    "contract-review",
+    "feature-reviewer",
+    "flow-validator",
+    "investigator",
+)
+
+
+def _bundled_skill_names() -> set[str]:
+    return {
+        path.name
+        for path in (BUNDLED_DIR / "skills").iterdir()
+        if path.is_dir() and (path / "SKILL.md").exists()
+    }
+
+
+def _installed_skill_names(skill_root: Path) -> list[str]:
+    return sorted(
+        path.name
+        for path in skill_root.iterdir()
+        if path.is_dir() and (path / "SKILL.md").exists()
+    )
+
+
+def _read_opencode_config(workspace: Path) -> dict[str, object]:
+    return json.loads((workspace / ".opencode" / "opencode.json").read_text(encoding="utf-8"))
 
 
 class TestInit:
@@ -350,6 +380,452 @@ class TestInit:
         assert mcp_env["ZENITH_WORKER_PROVIDER"] == "claude"
         assert mcp_env["ZENITH_VALIDATOR_PROVIDER"] == "codex"
         assert mcp_env["ZENITH_TERMINAL_REVIEWER_PROVIDER"] == "hermes"
+
+    def test_opencode_agent_selector_writes_native_host_config(
+        self,
+        runner: CliRunner,
+        workspace: Path,
+        env: dict[str, str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "should-not-persist-for-opencode")
+
+        r = runner.invoke(
+            cli, ["init", "--workspace-dir", str(workspace), "--agent", "opencode"]
+        )
+        assert r.exit_code == 0, r.output
+
+        config_path = workspace / ".opencode" / "opencode.json"
+        assert config_path.exists()
+        config = _read_opencode_config(workspace)
+        assert config["$schema"] == "https://opencode.ai/config.json"
+        server = config["mcp"]["zenith"]
+        assert server["type"] == "local"
+        assert set(server) == {
+            "type",
+            "command",
+            "enabled",
+            "timeout",
+            "environment",
+        }
+        assert server["command"] == ["uv", *_expected_mcp_server_args()]
+        assert server["enabled"] is True
+        assert server["timeout"] == 1000000
+
+        server_env = server["environment"]
+        assert server_env["ZENITH_ORCHESTRATOR_PROVIDER"] == "opencode"
+        assert server_env["ZENITH_WORKER_PROVIDER"] == "opencode"
+        assert server_env["ZENITH_WORKER_ACP_COMMAND"] == "opencode acp"
+        assert "ANTHROPIC_API_KEY" not in server_env
+        assert "model" not in config
+        assert "provider" not in config
+        assert "permission" not in config
+        assert "plugin" not in config
+
+        assert f"Initialized v5 project workspace at {workspace}" in r.output
+        assert "orchestrator=opencode, worker=opencode, validator=opencode." in r.output
+        assert "First read .opencode/orchestrator_prompt.md" in r.output
+
+    def test_opencode_init_preserves_unrelated_strict_json_settings(
+        self, runner: CliRunner, workspace: Path, env: dict[str, str]
+    ) -> None:
+        config_path = workspace / ".opencode" / "opencode.json"
+        config_path.parent.mkdir()
+        before = {
+            "$schema": "https://example.invalid/custom-schema.json",
+            "theme": "system",
+            "path": '/tmp/project "quoted"/space dir',
+            "mcp": {
+                "existing": {
+                    "type": "local",
+                    "command": ["node", "-e", 'console.log("kept")'],
+                    "environment": {"TOKEN": 'value with "quotes" and spaces'},
+                    "enabled": False,
+                    "timeout": 1234,
+                },
+                "zenith": {
+                    "type": "local",
+                    "command": ["old-zenith"],
+                    "environment": {"OLD": "1"},
+                    "enabled": False,
+                    "timeout": 1,
+                },
+            },
+        }
+        config_path.write_text(json.dumps(before, indent=2) + "\n", encoding="utf-8")
+
+        r = runner.invoke(
+            cli,
+            [
+                "init",
+                "--workspace-dir",
+                str(workspace),
+                "--agent",
+                "opencode",
+                "--worker-acp-command",
+                'opencode acp --flag="quoted value"',
+                "--validator-provider",
+                "codex",
+                "--validator-acp-command",
+                'codex-acp -c model="gpt-5.6"',
+            ],
+        )
+        assert r.exit_code == 0, r.output
+
+        after = _read_opencode_config(workspace)
+        assert after["$schema"] == before["$schema"]
+        assert after["theme"] == before["theme"]
+        assert after["path"] == before["path"]
+        mcp = after["mcp"]
+        assert mcp["existing"] == before["mcp"]["existing"]
+        assert mcp["zenith"] != before["mcp"]["zenith"]
+        server_env = mcp["zenith"]["environment"]
+        assert server_env["ZENITH_WORKER_ACP_COMMAND"] == 'opencode acp --flag="quoted value"'
+        assert server_env["ZENITH_VALIDATOR_PROVIDER"] == "codex"
+        assert server_env["ZENITH_VALIDATOR_ACP_COMMAND"] == 'codex-acp -c model="gpt-5.6"'
+
+    @pytest.mark.parametrize(
+        ("contents", "expected"),
+        [
+            ("{not-json", "expected strict JSON object"),
+            ("[]\n", "expected strict JSON object"),
+            ('{"mcp": []}\n', "mcp must be an object"),
+        ],
+    )
+    def test_opencode_init_rejects_unsafe_json_without_mutation(
+        self,
+        runner: CliRunner,
+        workspace: Path,
+        env: dict[str, str],
+        contents: str,
+        expected: str,
+    ) -> None:
+        config_path = workspace / ".opencode" / "opencode.json"
+        config_path.parent.mkdir()
+        config_path.write_text(contents, encoding="utf-8")
+
+        r = runner.invoke(
+            cli, ["init", "--workspace-dir", str(workspace), "--agent", "opencode"]
+        )
+
+        assert r.exit_code != 0
+        assert expected in r.output
+        assert config_path.read_text(encoding="utf-8") == contents
+        assert not (workspace / ".opencode" / ".opencode.json.tmp").exists()
+
+    def test_opencode_init_second_run_is_byte_idempotent(
+        self, runner: CliRunner, workspace: Path, env: dict[str, str]
+    ) -> None:
+        config_path = workspace / ".opencode" / "opencode.json"
+        config_path.parent.mkdir()
+        config_path.write_text(
+            json.dumps(
+                {
+                    "theme": "dark",
+                    "mcp": {
+                        "existing": {
+                            "type": "local",
+                            "command": ["node", "server.js"],
+                            "environment": {"A": "B"},
+                            "enabled": True,
+                            "timeout": 1000,
+                        }
+                    },
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        r = runner.invoke(
+            cli, ["init", "--workspace-dir", str(workspace), "--agent", "opencode"]
+        )
+        assert r.exit_code == 0, r.output
+        first = config_path.read_bytes()
+
+        r = runner.invoke(
+            cli, ["init", "--workspace-dir", str(workspace), "--agent", "opencode"]
+        )
+        assert r.exit_code == 0, r.output
+        assert config_path.read_bytes() == first
+        assert _read_opencode_config(workspace)["mcp"]["existing"]["command"] == [
+            "node",
+            "server.js",
+        ]
+
+    def test_opencode_jsonc_coexists_without_mutation_when_not_shadowing_zenith(
+        self, runner: CliRunner, workspace: Path, env: dict[str, str]
+    ) -> None:
+        jsonc_path = workspace / ".opencode" / "opencode.jsonc"
+        jsonc_path.parent.mkdir()
+        jsonc = """{
+  // user comments must stay byte-for-byte
+  "mcp": {
+    "user-server": {"type": "local", "command": ["node", "server.js"]}
+  },
+  "theme": "dark",
+}
+"""
+        jsonc_path.write_text(jsonc, encoding="utf-8")
+
+        r = runner.invoke(
+            cli, ["init", "--workspace-dir", str(workspace), "--agent", "opencode"]
+        )
+
+        assert r.exit_code == 0, r.output
+        assert jsonc_path.read_text(encoding="utf-8") == jsonc
+        assert _read_opencode_config(workspace)["mcp"]["zenith"]["type"] == "local"
+
+    def test_opencode_jsonc_shadowing_zenith_fails_without_mutation(
+        self, runner: CliRunner, workspace: Path, env: dict[str, str]
+    ) -> None:
+        config_path = workspace / ".opencode" / "opencode.json"
+        config_path.parent.mkdir()
+        original_json = '{"theme": "dark"}\n'
+        config_path.write_text(original_json, encoding="utf-8")
+        jsonc_path = workspace / ".opencode" / "opencode.jsonc"
+        jsonc = """{
+  // Loaded after opencode.json, so this would shadow Zenith's managed entry.
+  "mcp": {
+    "zenith": {"type": "local", "command": ["shadowed"]}
+  }
+}
+"""
+        jsonc_path.write_text(jsonc, encoding="utf-8")
+
+        r = runner.invoke(
+            cli, ["init", "--workspace-dir", str(workspace), "--agent", "opencode"]
+        )
+
+        assert r.exit_code != 0
+        assert "opencode.jsonc" in r.output
+        assert "mcp.zenith" in r.output
+        assert "remove that jsonc entry" in r.output.lower()
+        assert config_path.read_text(encoding="utf-8") == original_json
+        assert jsonc_path.read_text(encoding="utf-8") == jsonc
+
+    def test_opencode_root_jsonc_shadowing_zenith_fails_without_mutation(
+        self, runner: CliRunner, workspace: Path, env: dict[str, str]
+    ) -> None:
+        config_path = workspace / ".opencode" / "opencode.json"
+        config_path.parent.mkdir()
+        original_json = '{"theme": "system"}\n'
+        config_path.write_text(original_json, encoding="utf-8")
+        jsonc_path = workspace / "opencode.jsonc"
+        jsonc = """{
+  // Project-root config also loads after the managed .opencode JSON file.
+  "mcp": {
+    "zenith": {"type": "local", "command": ["shadowed"]}
+  }
+}
+"""
+        jsonc_path.write_text(jsonc, encoding="utf-8")
+
+        r = runner.invoke(
+            cli, ["init", "--workspace-dir", str(workspace), "--agent", "opencode"]
+        )
+
+        assert r.exit_code != 0
+        assert "opencode.jsonc" in r.output
+        assert "mcp.zenith" in r.output
+        assert config_path.read_text(encoding="utf-8") == original_json
+        assert jsonc_path.read_text(encoding="utf-8") == jsonc
+
+    def test_opencode_init_does_not_persist_ambient_defaults_or_provider_secrets(
+        self,
+        runner: CliRunner,
+        workspace: Path,
+        env: dict[str, str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("OPENCODE_MODEL", "openai/expensive")
+        monkeypatch.setenv("OPENCODE_PERMISSION", "allow-all")
+        monkeypatch.setenv("OPENCODE_PLUGIN", "ambient-plugin")
+        monkeypatch.setenv("OPENAI_API_KEY", "openai-secret")
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "anthropic-secret")
+        monkeypatch.setenv("GEMINI_API_KEY", "gemini-secret")
+
+        r = runner.invoke(
+            cli, ["init", "--workspace-dir", str(workspace), "--agent", "opencode"]
+        )
+        assert r.exit_code == 0, r.output
+
+        config_text = (workspace / ".opencode" / "opencode.json").read_text(
+            encoding="utf-8"
+        )
+        config = json.loads(config_text)
+        assert "model" not in config
+        assert "small_model" not in config
+        assert "provider" not in config
+        assert "permission" not in config
+        assert "plugin" not in config
+        assert "openai-secret" not in config_text
+        assert "anthropic-secret" not in config_text
+        assert "gemini-secret" not in config_text
+        server_env = config["mcp"]["zenith"]["environment"]
+        assert all("API_KEY" not in key for key in server_env)
+        assert all("AUTH_TOKEN" not in key for key in server_env)
+
+    def test_opencode_init_writes_mixed_provider_routing_values(
+        self, runner: CliRunner, workspace: Path, env: dict[str, str]
+    ) -> None:
+        r = runner.invoke(
+            cli,
+            [
+                "init",
+                "--workspace-dir",
+                str(workspace),
+                "--orchestrator-provider",
+                "opencode",
+                "--worker-provider",
+                "opencode",
+                "--validator-provider",
+                "claude",
+                "--terminal-reviewer-provider",
+                "codex",
+            ],
+        )
+        assert r.exit_code == 0, r.output
+
+        server_env = _read_opencode_config(workspace)["mcp"]["zenith"]["environment"]
+        assert server_env["ZENITH_ORCHESTRATOR_PROVIDER"] == "opencode"
+        assert server_env["ZENITH_WORKER_PROVIDER"] == "opencode"
+        assert server_env["ZENITH_WORKER_ACP_COMMAND"] == "opencode acp"
+        assert server_env["ZENITH_VALIDATOR_PROVIDER"] == "claude"
+        assert server_env["ZENITH_VALIDATOR_ACP_COMMAND"] == "claude-agent-acp"
+        assert server_env["ZENITH_TERMINAL_REVIEWER_PROVIDER"] == "codex"
+        assert server_env["ZENITH_TERMINAL_REVIEWER_ACP_COMMAND"] == "codex-acp"
+
+    def test_opencode_init_installs_prompt_agents_and_skill_surfaces(
+        self, runner: CliRunner, workspace: Path, env: dict[str, str]
+    ) -> None:
+        r = runner.invoke(
+            cli, ["init", "--workspace-dir", str(workspace), "--agent", "opencode"]
+        )
+        assert r.exit_code == 0, r.output
+
+        prompt_path = workspace / ".opencode" / "orchestrator_prompt.md"
+        expected_prompt = (
+            BUNDLED_DIR / "prompts" / "orchestrator" / "system_prompt.md"
+        ).read_text(encoding="utf-8")
+        assert prompt_path.read_text(encoding="utf-8") == expected_prompt
+        assert "Created " + str(prompt_path) in r.output
+
+        agents_dir = workspace / ".opencode" / "agents"
+        for agent_name in OPENCODE_AGENT_NAMES:
+            installed = agents_dir / f"{agent_name}.md"
+            assert installed.exists()
+            frontmatter, _ = parse_frontmatter(installed.read_text(encoding="utf-8"))
+            permission = frontmatter.get("permission")
+            assert frontmatter["mode"] == "subagent"
+            assert "model" not in frontmatter
+            assert isinstance(permission, dict)
+            assert permission["edit"] == "deny"
+            assert permission["task"] == "deny"
+
+        bundled_skill_names = _bundled_skill_names()
+        for rel in (".opencode/skills", ".agents/skills"):
+            skill_root = workspace / rel
+            skill_names = _installed_skill_names(skill_root)
+            assert set(skill_names) == bundled_skill_names
+            assert len(skill_names) == len(bundled_skill_names)
+            assert f"Installed bundled skills to {skill_root}" in r.output
+
+        assert f"Installed opencode subagents to {agents_dir}" in r.output
+        assert not (workspace / ".codex" / "orchestrator_prompt.md").exists()
+
+    def test_opencode_init_preserves_custom_orchestrator_prompt_on_reinit(
+        self, runner: CliRunner, workspace: Path, env: dict[str, str]
+    ) -> None:
+        first = runner.invoke(
+            cli, ["init", "--workspace-dir", str(workspace), "--agent", "opencode"]
+        )
+        assert first.exit_code == 0, first.output
+
+        prompt_path = workspace / ".opencode" / "orchestrator_prompt.md"
+        custom_prompt = "# Custom OpenCode Orchestrator\n\nDo not replace me.\n"
+        prompt_path.write_text(custom_prompt, encoding="utf-8")
+
+        second = runner.invoke(
+            cli, ["init", "--workspace-dir", str(workspace), "--agent", "opencode"]
+        )
+        assert second.exit_code == 0, second.output
+        assert prompt_path.read_text(encoding="utf-8") == custom_prompt
+        assert f"Created {prompt_path}" not in second.output
+
+    def test_opencode_init_preserves_existing_skills_and_deduplicates(
+        self, runner: CliRunner, workspace: Path, env: dict[str, str]
+    ) -> None:
+        custom_same_name = (
+            "---\n"
+            "name: scrutiny-validator\n"
+            "description: local replacement\n"
+            "---\n\n"
+            "Keep this local skill.\n"
+        )
+        for rel in (".opencode/skills", ".agents/skills"):
+            skill = workspace / rel / "scrutiny-validator" / "SKILL.md"
+            skill.parent.mkdir(parents=True, exist_ok=True)
+            skill.write_text(custom_same_name, encoding="utf-8")
+
+        local_skill = workspace / ".agents" / "skills" / "local-only" / "SKILL.md"
+        local_skill.parent.mkdir(parents=True, exist_ok=True)
+        local_body = "---\nname: local-only\ndescription: user skill\n---\n\nLocal.\n"
+        local_skill.write_text(local_body, encoding="utf-8")
+
+        for _ in range(2):
+            r = runner.invoke(
+                cli, ["init", "--workspace-dir", str(workspace), "--agent", "opencode"]
+            )
+            assert r.exit_code == 0, r.output
+
+        for rel in (".opencode/skills", ".agents/skills"):
+            skill_root = workspace / rel
+            skill = skill_root / "scrutiny-validator" / "SKILL.md"
+            skill_names = _installed_skill_names(skill_root)
+            assert skill.read_text(encoding="utf-8") == custom_same_name
+            assert len(skill_names) == len(set(skill_names))
+            assert (skill_root / "engineering-mission-playbook" / "SKILL.md").exists()
+
+        assert local_skill.read_text(encoding="utf-8") == local_body
+
+    def test_codex_init_asset_paths_still_install_codex_and_shared_surfaces(
+        self, runner: CliRunner, workspace: Path, env: dict[str, str]
+    ) -> None:
+        r = runner.invoke(
+            cli, ["init", "--workspace-dir", str(workspace), "--agent", "codex"]
+        )
+        assert r.exit_code == 0, r.output
+
+        assert (workspace / ".codex" / "agents" / "investigator.toml").exists()
+        assert (workspace / ".codex" / "orchestrator_prompt.md").exists()
+        assert (workspace / ".codex" / "skills" / "scrutiny-validator" / "SKILL.md").exists()
+        assert (workspace / ".agents" / "skills" / "scrutiny-validator" / "SKILL.md").exists()
+        assert not (workspace / ".opencode").exists()
+
+    def test_opencode_explicit_provider_selectors_are_accepted(
+        self, runner: CliRunner, workspace: Path, env: dict[str, str]
+    ) -> None:
+        r = runner.invoke(
+            cli,
+            [
+                "init",
+                "--workspace-dir",
+                str(workspace),
+                "--orchestrator-provider",
+                "opencode",
+                "--worker-provider",
+                "opencode",
+                "--validator-provider",
+                "opencode",
+                "--terminal-reviewer-provider",
+                "opencode",
+            ],
+        )
+        assert r.exit_code == 0, r.output
+        assert (workspace / ".opencode" / "opencode.json").exists()
+
 
 
 class TestListProjects:
