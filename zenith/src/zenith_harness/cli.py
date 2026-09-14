@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import tempfile
 from pathlib import Path
@@ -145,6 +146,7 @@ def init(
         f"worker={selection.worker.name}, "
         f"validator={selection.resolved_validation_worker.name}."
     )
+    _echo_opencode_diagnostics(workspace, selection)
     click.echo(
         "Bucket lives at $ZENITH_HOME/projects/<pid>/ — created on the first "
         "`start_project(brief, workspace_dir)` call."
@@ -300,6 +302,52 @@ def _echo_next_steps(orchestrator: ProviderDefinition) -> None:
         )
         click.echo("")
         click.echo("     <your instruction or query>")
+
+
+_SECRET_ASSIGNMENT_RE = re.compile(
+    r"(?i)\b([A-Z0-9_]*(?:API[_-]?KEY|AUTH[_-]?TOKEN|SECRET|PASSWORD)"
+    r"[A-Z0-9_]*)=([^ \t]+)"
+)
+_SECRET_FLAG_RE = re.compile(
+    r"(?i)(--(?:api[_-]?key|auth[_-]?token|token|secret|password)(?:=|\s+))"
+    r"([^ \t]+)"
+)
+_BEARER_TOKEN_RE = re.compile(r"(?i)\bBearer\s+([^ \t]+)")
+
+
+def _echo_opencode_diagnostics(workspace: Path, selection: ProviderSelection) -> None:
+    if selection.orchestrator.config_format != "opencode_config":
+        return
+
+    config_path = workspace / ".opencode" / "opencode.json"
+    click.echo("OpenCode diagnostics:")
+    click.echo(f"  host: {selection.orchestrator.name} ({config_path})")
+    click.echo(
+        f"  roles: orchestrator={selection.orchestrator.name}, "
+        f"worker={selection.worker.name}, "
+        f"validator={selection.resolved_validation_worker.name}, "
+        f"terminal reviewer={selection.resolved_terminal_reviewer.name}"
+    )
+    click.echo(
+        "  ACP commands: "
+        f"worker={_diagnostic_command(selection.resolved_worker_acp_command)}, "
+        f"validator={_diagnostic_command(selection.resolved_validation_worker_acp_command)}, "
+        "terminal reviewer="
+        f"{_diagnostic_command(selection.resolved_terminal_reviewer_acp_command)}"
+    )
+    click.echo(
+        "  model pins: worker=absent, validator=absent, "
+        "terminal reviewer=absent "
+        "(provider defaults preserved; no default model selected)"
+    )
+
+
+def _diagnostic_command(command: str | None) -> str:
+    if command is None:
+        return "absent"
+    redacted = _SECRET_ASSIGNMENT_RE.sub(r"\1=<redacted>", command)
+    redacted = _SECRET_FLAG_RE.sub(r"\1<redacted>", redacted)
+    return _BEARER_TOKEN_RE.sub("Bearer <redacted>", redacted)
 
 
 def _resolve_selection(

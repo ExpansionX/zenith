@@ -426,6 +426,41 @@ class TestInit:
         assert "orchestrator=opencode, worker=opencode, validator=opencode." in r.output
         assert "First read .opencode/orchestrator_prompt.md" in r.output
 
+    def test_opencode_init_stdout_includes_default_role_diagnostics(
+        self,
+        runner: CliRunner,
+        workspace: Path,
+        env: dict[str, str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("OPENCODE_MODEL", "openai/ambient-expensive")
+        monkeypatch.setenv("OPENAI_API_KEY", "openai-secret")
+
+        r = runner.invoke(
+            cli, ["init", "--workspace-dir", str(workspace), "--agent", "opencode"]
+        )
+        assert r.exit_code == 0, r.output
+
+        config_path = workspace / ".opencode" / "opencode.json"
+        assert "OpenCode diagnostics:" in r.output
+        assert f"host: opencode ({config_path})" in r.output
+        assert (
+            "roles: orchestrator=opencode, worker=opencode, "
+            "validator=opencode, terminal reviewer=opencode"
+        ) in r.output
+        assert (
+            "ACP commands: worker=opencode acp, validator=opencode acp, "
+            "terminal reviewer=opencode acp"
+        ) in r.output
+        assert (
+            "model pins: worker=absent, validator=absent, "
+            "terminal reviewer=absent"
+        ) in r.output
+        assert "provider defaults preserved; no default model selected" in r.output
+        assert "openai/ambient-expensive" not in r.output
+        assert "openai-secret" not in r.output
+        assert "OPENAI_API_KEY" not in r.output
+
     def test_opencode_init_preserves_unrelated_strict_json_settings(
         self, runner: CliRunner, workspace: Path, env: dict[str, str]
     ) -> None:
@@ -696,6 +731,23 @@ class TestInit:
         assert server_env["ZENITH_VALIDATOR_ACP_COMMAND"] == "claude-agent-acp"
         assert server_env["ZENITH_TERMINAL_REVIEWER_PROVIDER"] == "codex"
         assert server_env["ZENITH_TERMINAL_REVIEWER_ACP_COMMAND"] == "codex-acp"
+
+        config_path = workspace / ".opencode" / "opencode.json"
+        assert "OpenCode diagnostics:" in r.output
+        assert f"host: opencode ({config_path})" in r.output
+        assert (
+            "roles: orchestrator=opencode, worker=opencode, "
+            "validator=claude, terminal reviewer=codex"
+        ) in r.output
+        assert (
+            "ACP commands: worker=opencode acp, validator=claude-agent-acp, "
+            "terminal reviewer=codex-acp"
+        ) in r.output
+        assert (
+            "model pins: worker=absent, validator=absent, "
+            "terminal reviewer=absent"
+        ) in r.output
+        assert "provider defaults preserved; no default model selected" in r.output
 
     def test_opencode_init_installs_prompt_agents_and_skill_surfaces(
         self, runner: CliRunner, workspace: Path, env: dict[str, str]
