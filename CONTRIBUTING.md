@@ -52,6 +52,11 @@ work. If you add future live OpenCode smoke tests, keep them opt-in and document
 that normal worker and validator sessions use the credentials available to the
 `opencode` process and therefore share the operator's billing trust boundary.
 
+Keep the audience-specific OpenCode docs in sync with code changes:
+[`docs/opencode-support/user.md`](docs/opencode-support/user.md),
+[`docs/opencode-support/admin.md`](docs/opencode-support/admin.md), and
+[`docs/opencode-support/developer.md`](docs/opencode-support/developer.md).
+
 ## License
 
 By contributing, you agree that your contributions will be licensed under the [Apache License 2.0](LICENSE).

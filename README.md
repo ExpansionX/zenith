@@ -160,6 +160,11 @@ use disposable local OpenCode configuration checks such as `opencode debug
 config`; any live-provider smoke that can spend tokens must stay explicit and
 opt-in.
 
+For audience-specific OpenCode guidance, see the
+[user](docs/opencode-support/user.md),
+[admin](docs/opencode-support/admin.md), and
+[developer](docs/opencode-support/developer.md) guides.
+
 ## How Zenith Works
 
 <p align="center">

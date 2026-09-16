@@ -111,6 +111,11 @@ models, permission policy, plugin configuration, or global config.
 Default checks are hermetic. Live OpenCode provider checks may spend tokens and
 must remain explicit opt-in tests.
 
+Detailed OpenCode guidance is split by audience in the repository docs:
+[user guide](../docs/opencode-support/user.md),
+[admin guide](../docs/opencode-support/admin.md), and
+[developer guide](../docs/opencode-support/developer.md).
+
 ## Development
 
 ```bash
