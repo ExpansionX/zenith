@@ -1,15 +1,31 @@
 """CLI integration tests — init / list-projects / show-project / install-skills."""
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 import tomllib
 from pathlib import Path
 
+import click
 import pytest
 from click.testing import CliRunner
 
 from zenith_harness.assets import parse_frontmatter
-from zenith_harness.cli import cli
+import zenith_harness.cli as cli_module
+from zenith_harness.cli import (
+    _diagnostic_command,
+    _jsonc_defines_mcp_zenith,
+    _replace_managed_block,
+    _resolve_selection,
+    _storage_env,
+    _strict_json_defines_mcp_zenith,
+    _strip_jsonc_comments,
+    _strip_jsonc_trailing_commas,
+    _write_bootstrap_config,
+    _write_opencode_config,
+    cli,
+)
+from zenith_harness.providers import ProviderSelection, get_provider
 
 
 @pytest.fixture
@@ -914,6 +930,241 @@ class TestInit:
         )
         assert r.exit_code == 0, r.output
         assert (workspace / ".opencode" / "opencode.json").exists()
+
+
+class TestOpenCodeConfigHelpers:
+    def test_diagnostic_command_redacts_sensitive_forms(self) -> None:
+        command = (
+            "OPENAI_API_KEY=super-secret opencode acp --token bearer-secret "
+            "--auth-token next-secret -H 'Authorization: Bearer raw-secret'"
+        )
+
+        redacted = _diagnostic_command(command)
+
+        assert _diagnostic_command(None) == "absent"
+        assert "super-secret" not in redacted
+        assert "bearer-secret" not in redacted
+        assert "next-secret" not in redacted
+        assert "raw-secret" not in redacted
+        assert "OPENAI_API_KEY=<redacted>" in redacted
+        assert "--token <redacted>" in redacted
+        assert "--auth-token <redacted>" in redacted
+        assert "Bearer <redacted>" in redacted
+
+    def test_resolve_selection_rejects_agent_orchestrator_conflict(self) -> None:
+        with pytest.raises(
+            click.UsageError,
+            match="--agent conflicts with --orchestrator-provider",
+        ):
+            _resolve_selection(
+                agent="opencode",
+                orchestrator="codex",
+                worker=None,
+                worker_acp_command=None,
+                validator=None,
+                validator_acp_command=None,
+                terminal_reviewer=None,
+                terminal_reviewer_acp_command=None,
+            )
+
+    def test_storage_env_resolves_explicit_zenith_home(self, tmp_path: Path) -> None:
+        selection = ProviderSelection(
+            orchestrator=get_provider("opencode"),
+            worker=get_provider("opencode"),
+        )
+        zenith_home = tmp_path / "home" / ".." / "zenith-home"
+
+        env = _storage_env(
+            zenith_home=str(zenith_home),
+            workspace=tmp_path,
+            selection=selection,
+        )
+
+        assert env == {"ZENITH_HOME": str(zenith_home.resolve())}
+
+    def test_write_bootstrap_config_rejects_unknown_config_format(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        bad_orchestrator = replace(
+            get_provider("opencode"),
+            config_format="future_config",
+        )
+        selection = ProviderSelection(
+            orchestrator=bad_orchestrator,
+            worker=get_provider("opencode"),
+        )
+        monkeypatch.setattr(cli_module, "_mcp_server_args", lambda: ["server"])
+
+        with pytest.raises(ValueError, match="unsupported config_format: future_config"):
+            _write_bootstrap_config(tmp_path, selection, {}, {})
+
+    def test_write_opencode_config_cleans_temp_file_when_replace_fails(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        config_path = tmp_path / ".opencode" / "opencode.json"
+
+        def fail_replace(src: Path, dst: Path) -> None:
+            raise RuntimeError(f"replace failed for {src} -> {dst}")
+
+        monkeypatch.setattr(cli_module.os, "replace", fail_replace)
+
+        with pytest.raises(RuntimeError, match="replace failed"):
+            _write_opencode_config(config_path, {"type": "local"})
+
+        assert not config_path.exists()
+        assert list(config_path.parent.glob(".opencode.json.*.tmp")) == []
+
+    @pytest.mark.parametrize(
+        "config_path",
+        [
+            Path("opencode.json"),
+            Path("nested/opencode.json"),
+        ],
+    )
+    def test_write_opencode_config_allows_absent_root_shadow_config(
+        self,
+        tmp_path: Path,
+        config_path: Path,
+    ) -> None:
+        path = tmp_path / config_path
+
+        _write_opencode_config(path, {"type": "local"})
+
+        assert json.loads(path.read_text(encoding="utf-8"))["mcp"]["zenith"] == {
+            "type": "local"
+        }
+
+    def test_strict_json_shadow_detection_handles_invalid_and_non_object(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        invalid_shadow = tmp_path / "shadow.json"
+        invalid_shadow.write_text('{"mcp": {"zenith": ', encoding="utf-8")
+        invalid_irrelevant = tmp_path / "irrelevant.json"
+        invalid_irrelevant.write_text('{"theme": ', encoding="utf-8")
+        non_object = tmp_path / "array.json"
+        non_object.write_text('["mcp", "zenith"]', encoding="utf-8")
+        valid_shadow = tmp_path / "valid.json"
+        valid_shadow.write_text(
+            json.dumps({"mcp": {"zenith": {"type": "local"}}}),
+            encoding="utf-8",
+        )
+
+        with pytest.raises(click.ClickException, match="Cannot verify"):
+            _strict_json_defines_mcp_zenith(invalid_shadow)
+        assert _strict_json_defines_mcp_zenith(invalid_irrelevant) is False
+        assert _strict_json_defines_mcp_zenith(non_object) is False
+        assert _strict_json_defines_mcp_zenith(valid_shadow) is True
+
+    def test_jsonc_shadow_detection_handles_invalid_and_non_object(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        invalid_shadow = tmp_path / "shadow.jsonc"
+        invalid_shadow.write_text(
+            '{\n  // comment\n  "mcp": {"zenith": \n',
+            encoding="utf-8",
+        )
+        invalid_irrelevant = tmp_path / "irrelevant.jsonc"
+        invalid_irrelevant.write_text('{"theme": ', encoding="utf-8")
+        non_object = tmp_path / "array.jsonc"
+        non_object.write_text('["mcp", "zenith",]', encoding="utf-8")
+        valid_shadow = tmp_path / "valid.jsonc"
+        valid_shadow.write_text(
+            '{\n  "mcp": {"zenith": {"type": "local",},},\n}\n',
+            encoding="utf-8",
+        )
+
+        with pytest.raises(click.ClickException, match="Cannot verify"):
+            _jsonc_defines_mcp_zenith(invalid_shadow)
+        assert _jsonc_defines_mcp_zenith(invalid_irrelevant) is False
+        assert _jsonc_defines_mcp_zenith(non_object) is False
+        assert _jsonc_defines_mcp_zenith(valid_shadow) is True
+
+    def test_jsonc_strippers_preserve_string_literals(self) -> None:
+        jsonc = r'''{
+  "slash": "proto://value",
+  "block": "literal /* not comment */ value",
+  "quote": "escaped \" // not comment",
+  // remove this line comment
+  "list": [
+    "kept",
+  ],
+  /*
+   * remove this block comment but keep newlines
+   */
+  "mcp": {
+    "zenith": {"type": "local",},
+  },
+}
+'''
+
+        without_comments = _strip_jsonc_comments(jsonc)
+        without_commas = _strip_jsonc_trailing_commas(without_comments)
+        parsed = json.loads(without_commas)
+
+        assert parsed["slash"] == "proto://value"
+        assert parsed["block"] == "literal /* not comment */ value"
+        assert parsed["quote"] == 'escaped " // not comment'
+        assert parsed["list"] == ["kept"]
+        assert parsed["mcp"]["zenith"] == {"type": "local"}
+        assert "remove this line comment" not in without_comments
+        assert "remove this block comment" not in without_comments
+
+    def test_replace_managed_block_replaces_existing_block_and_preserves_suffix(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        config_path = tmp_path / "config.toml"
+        config_path.write_text(
+            "prefix = true\n"
+            "\n"
+            "# BEGIN zenith\n"
+            "old = true\n"
+            "# END zenith\n"
+            "\n"
+            "suffix = true\n",
+            encoding="utf-8",
+        )
+
+        _replace_managed_block(
+            config_path,
+            "# BEGIN zenith",
+            "# END zenith",
+            "# BEGIN zenith\nnew = true\n# END zenith\n",
+        )
+
+        updated = config_path.read_text(encoding="utf-8")
+        assert "prefix = true" in updated
+        assert "new = true" in updated
+        assert "suffix = true" in updated
+        assert "old = true" not in updated
+
+    def test_replace_managed_block_appends_when_block_missing(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        config_path = tmp_path / "config.toml"
+        config_path.write_text("prefix = true\n", encoding="utf-8")
+
+        _replace_managed_block(
+            config_path,
+            "# BEGIN zenith",
+            "# END zenith",
+            "# BEGIN zenith\nnew = true\n# END zenith\n",
+        )
+
+        assert config_path.read_text(encoding="utf-8") == (
+            "prefix = true\n"
+            "\n"
+            "# BEGIN zenith\n"
+            "new = true\n"
+            "# END zenith\n"
+        )
 
 
 
