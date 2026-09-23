@@ -16,6 +16,19 @@ from .models import Task, TerminalReviewHandoff, ValidateHandoff, WorkHandoff
 NodeHandoff = WorkHandoff | ValidateHandoff
 
 
+# Persisted failure identity for the one terminal-review failure that is safe
+# to retry in place.  Keep the callback error and its coordinator wrapper
+# together so the ACP runner, coordinator, and recovery guard cannot drift.
+TERMINAL_REVIEW_CALLBACK_MISSING_MESSAGE = (
+    "Terminal reviewer exited without calling submit_terminal_review; "
+    "no terminal review was written. The mission cannot be sealed as done "
+    "without an explicit reviewer verdict."
+)
+TERMINAL_REVIEW_CALLBACK_MISSING_FAILURE_REASON = (
+    f"Terminal reviewer crashed: {TERMINAL_REVIEW_CALLBACK_MISSING_MESSAGE}"
+)
+
+
 @dataclass
 class DispatchRequest:
     project_id: str
@@ -101,4 +114,6 @@ __all__ = [
     "NodeHandoff",
     "MockDispatcher",
     "MockTerminalReviewer",
+    "TERMINAL_REVIEW_CALLBACK_MISSING_MESSAGE",
+    "TERMINAL_REVIEW_CALLBACK_MISSING_FAILURE_REASON",
 ]

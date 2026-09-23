@@ -376,3 +376,51 @@ class TestShowProject:
         r = runner.invoke(cli, ["show-project", "ghost"])
         assert r.exit_code != 0
         assert "not found" in r.output.lower()
+
+
+class TestRetryTerminalReview:
+    def test_recovers_exact_missing_callback_failure(
+        self,
+        runner: CliRunner,
+        workspace: Path,
+        harness_home: Path,
+        env: dict[str, str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from zenith_harness.config import HarnessConfig
+        from zenith_harness.dispatcher import (
+            TERMINAL_REVIEW_CALLBACK_MISSING_FAILURE_REASON,
+            MockTerminalReviewer,
+        )
+        from zenith_harness.models import (
+            Failed,
+            TaskList,
+            TaskStateFile,
+            TerminalReviewHandoff,
+        )
+        from zenith_harness.storage import ProjectStore
+
+        store = ProjectStore(HarnessConfig.discover())
+        record = store.create_project("brief", workspace, project_id="recover-me")
+        record.current_mission_id = "mission-001"
+        store.save_project(record)
+        store.save_task_list("recover-me", "mission-001", TaskList())
+        store.save_task_state("recover-me", "mission-001", TaskStateFile())
+        store.save_state(
+            "recover-me",
+            Failed(reason=TERMINAL_REVIEW_CALLBACK_MISSING_FAILURE_REASON),
+        )
+        reviewer = MockTerminalReviewer(
+            TerminalReviewHandoff(done=True, report="CLI recovery clean")
+        )
+        monkeypatch.setattr(
+            "zenith_harness.acp_runner.ACPTerminalReviewer",
+            lambda config: reviewer,
+        )
+
+        result = runner.invoke(cli, ["retry-terminal-review", "recover-me"])
+
+        assert result.exit_code == 0, result.output
+        assert "state=done" in result.output
+        assert store.load_state("recover-me").state == "done"  # type: ignore[union-attr]
+        assert len(reviewer.calls) == 1

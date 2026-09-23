@@ -12,6 +12,7 @@ from typing import Literal
 
 from . import attention as attn_factory
 from .dispatcher import (
+    TERMINAL_REVIEW_CALLBACK_MISSING_FAILURE_REASON,
     DispatchRequest,
     NodeDispatcher,
     NodeHandoff,
@@ -451,6 +452,55 @@ class MissionCoordinator:
                 f"mission has runnable task work ({task.id}); call advance_project first"
             )
 
+        return self._enter_terminal_review(mid)
+
+    def retry_terminal_review(self, mid: str) -> StepResult:
+        """Retry only the persisted missing-callback terminal-review failure.
+
+        This is intentionally separate from ``close_mission``: recovery never
+        rewinds the project to ``mission_running`` and therefore cannot reopen
+        normal dispatch.  Every closure precondition is checked again before a
+        new reviewer is allowed to run.
+        """
+        state = self.store.load_state(self.project_id)
+        if (
+            not isinstance(state, Failed)
+            or state.reason != TERMINAL_REVIEW_CALLBACK_MISSING_FAILURE_REASON
+        ):
+            return StepResult.idle(
+                "terminal-review retry requires the exact missing-callback failure"
+            )
+        if self.store.load_attention(self.project_id):
+            return StepResult.idle(
+                "terminal-review retry requires an empty attention queue"
+            )
+        try:
+            tl = self.store.load_task_list(self.project_id, mid)
+        except FileNotFoundError:
+            return StepResult.idle(f"tasks.json missing for {mid}")
+        task_state = self.store.load_task_state(self.project_id, mid)
+        running = [
+            task.id
+            for task in tl.tasks
+            if task_state.status_of(task.id) == "running"
+        ]
+        if running:
+            return StepResult.idle(
+                "terminal-review retry requires no running tasks "
+                f"({', '.join(running)})"
+            )
+        gate_event = self._try_evaluate_a_gate(tl, task_state)
+        if gate_event is not None:
+            return StepResult.idle(
+                f"mission has a ready gate ({gate_event.gate.id}); "
+                "terminal-review retry is not eligible"
+            )
+        task = self._next_runnable_task(tl, task_state)
+        if task is not None:
+            return StepResult.idle(
+                f"mission has runnable task work ({task.id}); "
+                "terminal-review retry is not eligible"
+            )
         return self._enter_terminal_review(mid)
 
     # ------------------------------------------------------------------

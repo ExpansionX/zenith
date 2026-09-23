@@ -267,6 +267,44 @@ def abort_project_cmd(project_id: str, reason: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# retry-terminal-review
+# ---------------------------------------------------------------------------
+
+
+@cli.command("retry-terminal-review")
+@click.argument("project_id")
+def retry_terminal_review_cmd(project_id: str) -> None:
+    """Retry a failed terminal review that exited before its callback.
+
+    The controller fails closed unless the persisted failure reason exactly
+    matches the missing-callback infrastructure failure and the mission is
+    still quiescent.  No runtime cursor is rewound or edited by this command.
+    """
+    from .acp_runner import ACPTerminalReviewer
+    from .controller import ProjectController, ToolError
+    from .dispatcher import MockDispatcher
+    from .models import WorkHandoff
+
+    config = HarnessConfig.discover()
+    controller = ProjectController(
+        config,
+        MockDispatcher(
+            lambda request: WorkHandoff(
+                node_id=request.task.id,
+                done=False,
+                report="terminal-review recovery must not dispatch task work",
+            )
+        ),
+        ACPTerminalReviewer(config),
+    )
+    try:
+        env = controller.retry_terminal_review(project_id)
+    except ToolError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"Retried terminal review for {project_id}: state={env.state.state}")
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 

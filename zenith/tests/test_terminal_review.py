@@ -9,8 +9,10 @@ from pathlib import Path
 import pytest
 
 from zenith_harness.config import HarnessConfig
-from zenith_harness.controller import ProjectController
+from zenith_harness.controller import ProjectController, ToolError
 from zenith_harness.dispatcher import (
+    TERMINAL_REVIEW_CALLBACK_MISSING_FAILURE_REASON,
+    TERMINAL_REVIEW_CALLBACK_MISSING_MESSAGE,
     DispatchRequest,
     MockDispatcher,
     MockTerminalReviewer,
@@ -18,6 +20,7 @@ from zenith_harness.dispatcher import (
 )
 from zenith_harness.models import (
     Decision,
+    Failed,
     Task,
     TaskList,
     TerminalReviewHandoff,
@@ -89,6 +92,33 @@ def _responder(req: DispatchRequest) -> NodeHandoff:
         items=[ValidationItem(item_id="VAL-001", passed=True)],
         passed=True,
     )
+
+
+class _SequenceTerminalReviewer:
+    def __init__(self, results: list[TerminalReviewHandoff | Exception]):
+        self.results = results
+        self.calls: list[tuple[str, str, str]] = []
+
+    def review(
+        self, project_id: str, mission_id: str, spawn_ts: str
+    ) -> TerminalReviewHandoff:
+        self.calls.append((project_id, mission_id, spawn_ts))
+        result = self.results.pop(0)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+
+def _drain_to_terminal_review(controller: ProjectController, pid: str) -> None:
+    controller.submit_plan(pid, _simple_tl())
+    env = controller.advance_project(pid)
+    assert env.state.state == "attention_needed"
+    items = controller.store.load_attention(pid)
+    controller.decide_attention(
+        pid, [Decision(item_id=items[0].id, action="continue")]
+    )
+    env = controller.advance_project(pid)
+    assert env.state.state == "mission_running"
 
 
 class TestCleanReview:
@@ -187,3 +217,89 @@ class TestAbortRoundtripFromTerminalReview:
             ],
         )
         assert env.state.state == "aborted"
+
+
+class TestTerminalReviewRetry:
+    def test_missing_callback_retry_can_seal_same_project_done(
+        self, config: HarnessConfig, workspace: Path
+    ) -> None:
+        reviewer = _SequenceTerminalReviewer(
+            [
+                RuntimeError(TERMINAL_REVIEW_CALLBACK_MISSING_MESSAGE),
+                TerminalReviewHandoff(done=True, report="retry clean"),
+            ]
+        )
+        controller = ProjectController(config, MockDispatcher(_responder), reviewer)
+        pid = _start_and_seed_contract(controller, workspace)
+        _drain_to_terminal_review(controller, pid)
+
+        failed = controller.end_mission(pid)
+        assert failed.state == Failed(
+            reason=TERMINAL_REVIEW_CALLBACK_MISSING_FAILURE_REASON
+        )
+
+        recovered = controller.retry_terminal_review(pid)
+        assert recovered.state.state == "done"
+        assert len(reviewer.calls) == 2
+        closeout = controller.store.mission_dir(pid, "mission-001") / "closeout.md"
+        assert "retry clean" in closeout.read_text()
+
+    def test_missing_callback_retry_can_return_terminal_attention(
+        self, config: HarnessConfig, workspace: Path
+    ) -> None:
+        reviewer = _SequenceTerminalReviewer(
+            [
+                RuntimeError(TERMINAL_REVIEW_CALLBACK_MISSING_MESSAGE),
+                TerminalReviewHandoff(done=False, report="remaining gap"),
+            ]
+        )
+        controller = ProjectController(config, MockDispatcher(_responder), reviewer)
+        pid = _start_and_seed_contract(controller, workspace)
+        _drain_to_terminal_review(controller, pid)
+        controller.end_mission(pid)
+
+        recovered = controller.retry_terminal_review(pid)
+        assert recovered.state.state == "attention_needed"
+        items = controller.store.load_attention(pid)
+        assert len(items) == 1
+        assert items[0].kind == "terminal_review"
+        assert items[0].report == "remaining gap"
+
+    def test_retry_rejects_normal_state_and_unrelated_failure(
+        self, config: HarnessConfig, workspace: Path
+    ) -> None:
+        reviewer = MockTerminalReviewer(
+            TerminalReviewHandoff(done=True, report="unused")
+        )
+        controller = ProjectController(config, MockDispatcher(_responder), reviewer)
+        pid = _start_and_seed_contract(controller, workspace)
+
+        with pytest.raises(ToolError, match="terminal_review_retry_not_allowed"):
+            controller.retry_terminal_review(pid)
+
+        controller.store.save_state(pid, Failed(reason="some other failure"))
+        with pytest.raises(ToolError, match="terminal_review_retry_not_allowed"):
+            controller.retry_terminal_review(pid)
+        assert reviewer.calls == []
+
+    def test_retry_rejects_project_that_is_no_longer_quiescent(
+        self, config: HarnessConfig, workspace: Path
+    ) -> None:
+        reviewer = _SequenceTerminalReviewer(
+            [RuntimeError(TERMINAL_REVIEW_CALLBACK_MISSING_MESSAGE)]
+        )
+        controller = ProjectController(config, MockDispatcher(_responder), reviewer)
+        pid = _start_and_seed_contract(controller, workspace)
+        _drain_to_terminal_review(controller, pid)
+        controller.end_mission(pid)
+
+        task_state = controller.store.load_task_state(pid, "mission-001")
+        task_state.set_status("w1", "pending")
+        controller.store.save_task_state(pid, "mission-001", task_state)
+
+        with pytest.raises(ToolError, match="terminal_review_retry_not_eligible"):
+            controller.retry_terminal_review(pid)
+        assert controller.store.load_state(pid) == Failed(
+            reason=TERMINAL_REVIEW_CALLBACK_MISSING_FAILURE_REASON
+        )
+        assert len(reviewer.calls) == 1
