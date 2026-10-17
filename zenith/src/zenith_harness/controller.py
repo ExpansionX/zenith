@@ -14,7 +14,11 @@ from dataclasses import dataclass
 
 from .config import HarnessConfig
 from .coordinator import MissionCoordinator
-from .dispatcher import NodeDispatcher, TerminalReviewer
+from .dispatcher import (
+    TERMINAL_REVIEW_CALLBACK_MISSING_FAILURE_REASON,
+    NodeDispatcher,
+    TerminalReviewer,
+)
 from .envelope import EnvelopeDagMode, make_envelope
 from .models import (
     AttentionItemInternal,
@@ -24,6 +28,7 @@ from .models import (
     Decision,
     Draft,
     Envelope,
+    Failed,
     MissionPlanning,
     MissionRunning,
     ProjectState,
@@ -152,6 +157,41 @@ class ProjectController:
             raise ToolError(
                 "mission_not_ready_to_close",
                 result.detail or "mission still has runnable task work",
+            )
+        return self._build_envelope(project_id, dag_mode="none")
+
+    def retry_terminal_review(self, project_id: str) -> Envelope:
+        """Retry one narrowly recoverable terminal-review infrastructure failure.
+
+        This recovery entry point deliberately accepts neither arbitrary
+        ``Failed`` projects nor normal lifecycle states.  It delegates fresh
+        quiescence checks to the coordinator and never rewrites the project
+        state to ``mission_running``.
+        """
+        state = self._require_state(project_id)
+        if (
+            not isinstance(state, Failed)
+            or state.reason != TERMINAL_REVIEW_CALLBACK_MISSING_FAILURE_REASON
+        ):
+            raise ToolError(
+                "terminal_review_retry_not_allowed",
+                "retry requires the exact terminal-review missing-callback failure",
+            )
+        record = self.store.load_project(project_id)
+        mid = record.current_mission_id
+        if not mid:
+            raise ToolError(
+                "terminal_review_retry_not_allowed",
+                "project has no current mission to review",
+            )
+        coordinator = MissionCoordinator(
+            self.store, project_id, self.dispatcher, self.terminal_reviewer
+        )
+        result = coordinator.retry_terminal_review(mid)
+        if result.kind == "idle":
+            raise ToolError(
+                "terminal_review_retry_not_eligible",
+                result.detail or "mission is not eligible for terminal-review retry",
             )
         return self._build_envelope(project_id, dag_mode="none")
 

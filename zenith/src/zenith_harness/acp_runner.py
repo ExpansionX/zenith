@@ -16,7 +16,11 @@ from typing import Any, Awaitable, Callable, ClassVar, Coroutine, Literal
 
 from .assets import AssetLoader
 from .config import HarnessConfig
-from .dispatcher import DispatchRequest, NodeHandoff
+from .dispatcher import (
+    TERMINAL_REVIEW_CALLBACK_MISSING_MESSAGE,
+    DispatchRequest,
+    NodeHandoff,
+)
 from .models import (
     Task,
     TerminalReviewHandoff,
@@ -953,11 +957,7 @@ class ACPNodeRunner:
 
         if report_path.exists():
             return TerminalReviewHandoff.model_validate_json(report_path.read_text())
-        raise RuntimeError(
-            "Terminal reviewer exited without calling submit_terminal_review; "
-            "no terminal review was written. The mission cannot be sealed as done "
-            "without an explicit reviewer verdict."
-        )
+        raise RuntimeError(TERMINAL_REVIEW_CALLBACK_MISSING_MESSAGE)
 
     # ------------------------------------------------------------------
     # Subprocess plumbing
